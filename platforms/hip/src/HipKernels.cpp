@@ -443,11 +443,12 @@ void HipCalcNonbondedForceKernel::initialize(const System& system, const Nonbond
             }
             if (pmeio == NULL) {
                 pmeGridIndexKernel = cu.getKernel(module, "findAtomGridIndex");
-                pmeSpreadChargeKernel = cu.getKernel(module, "gridSpreadCharge");
                 pmeConvolutionKernel = cu.getKernel(module, "reciprocalConvolution");
-                pmeInterpolateForceKernel = cu.getKernel(module, "gridInterpolateForce");
                 pmeEvalEnergyKernel = cu.getKernel(module, "gridEvaluateEnergy");
-                pmeFinishSpreadChargeKernel = cu.getKernel(module, "finishSpreadCharge");
+                hipModule_t module2 = cu.createModule(HipKernelSources::vectorOps+cu.replaceStrings(HipKernelSources::pme, replacements), pmeDefines);
+                pmeSpreadChargeKernel = cu.getKernel(module2, "gridSpreadCharge");
+                pmeFinishSpreadChargeKernel = cu.getKernel(module2, "finishSpreadCharge");
+                pmeInterpolateForceKernel = cu.getKernel(module2, "gridInterpolateForce");
                 hipFuncSetCacheConfig(pmeSpreadChargeKernel, hipFuncCachePreferShared);
                 hipFuncSetCacheConfig(pmeInterpolateForceKernel, hipFuncCachePreferL1);
                 if (doLJPME) {
@@ -459,12 +460,13 @@ void HipCalcNonbondedForceKernel::initialize(const System& system, const Nonbond
                     pmeDefines["USE_LJPME"] = "1";
                     pmeDefines["CHARGE_FROM_SIGEPS"] = "1";
                     module = cu.createModule(HipKernelSources::vectorOps+CommonKernelSources::pme, pmeDefines);
-                    pmeDispersionFinishSpreadChargeKernel = cu.getKernel(module, "finishSpreadCharge");
                     pmeDispersionGridIndexKernel = cu.getKernel(module, "findAtomGridIndex");
-                    pmeDispersionSpreadChargeKernel = cu.getKernel(module, "gridSpreadCharge");
                     pmeDispersionConvolutionKernel = cu.getKernel(module, "reciprocalConvolution");
                     pmeEvalDispersionEnergyKernel = cu.getKernel(module, "gridEvaluateEnergy");
-                    pmeInterpolateDispersionForceKernel = cu.getKernel(module, "gridInterpolateForce");
+                    module2 = cu.createModule(HipKernelSources::vectorOps+HipKernelSources::pme, pmeDefines);
+                    pmeDispersionSpreadChargeKernel = cu.getKernel(module2, "gridSpreadCharge");
+                    pmeDispersionFinishSpreadChargeKernel = cu.getKernel(module2, "finishSpreadCharge");
+                    pmeInterpolateDispersionForceKernel = cu.getKernel(module2, "gridInterpolateForce");
                     hipFuncSetCacheConfig(pmeDispersionSpreadChargeKernel, hipFuncCachePreferL1);
                 }
 
