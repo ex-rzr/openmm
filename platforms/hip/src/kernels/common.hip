@@ -16,11 +16,32 @@
 #define GROUP_ID blockIdx.x
 #define NUM_GROUPS gridDim.x
 #define SYNC_THREADS __syncthreads();
+#define SYNC_WARPS {__builtin_amdgcn_wave_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");}
 #define MEM_FENCE __threadfence_block();
 #define ATOMIC_ADD(dest, value) atomicAdd(dest, value)
 
 typedef long long mm_long;
 typedef unsigned long long mm_ulong;
 
-#define SUPPORTS_64_BIT_ATOMICS __HIP_ARCH_HAS_GLOBAL_INT64_ATOMICS__
-#define SUPPORTS_DOUBLE_PRECISION __HIP_ARCH_HAS_DOUBLES__
+#define SUPPORTS_DOUBLE_PRECISION 1
+
+#ifdef USE_DOUBLE_PRECISION
+
+__device__ inline long long realToFixedPoint(double x) {
+    return static_cast<long long>(x * 0x100000000);
+}
+
+#else
+
+__device__ inline long long realToFixedPoint(float x) {
+    // More effective way to do static_cast<long long>(x * 0x100000000)
+    int hi = __float2int_rz(x);
+    float rem = (x - __float2int_rz(x)) * 0x100000000;
+    bool isRemNeg = rem < -0.5f;
+    int lo = __float2uint_rn(fabsf(rem));
+    return static_cast<long long>(
+        (static_cast<unsigned long long>(static_cast<unsigned int>(isRemNeg ? hi - 1 : hi)) << 32) |
+        static_cast<unsigned long long>(static_cast<unsigned int>(isRemNeg ? -lo : +lo)));
+}
+
+#endif
