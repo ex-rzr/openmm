@@ -1,5 +1,5 @@
-#ifndef __OPENMM_HIPFFT3D_H__
-#define __OPENMM_HIPFFT3D_H__
+#ifndef __OPENMM_HIPVKFFT_H__
+#define __OPENMM_HIPVKFFT_H__
 
 /* -------------------------------------------------------------------------- *
  *                                   OpenMM                                   *
@@ -10,9 +10,9 @@
  * Medical Research, grant U54 GM072970. See https://simtk.org.               *
  *                                                                            *
  * Portions copyright (c) 2009-2015 Stanford University and the Authors.      *
- * Portions copyright (C) 2020 Advanced Micro Devices, Inc. All Rights        *
+ * Portions copyright (C) 2021 Advanced Micro Devices, Inc. All Rights        *
  * Reserved.                                                                  *
- * Authors: Peter Eastman, Nicholas Curtis                                    *
+ * Authors:                                                                   *
  * Contributors:                                                              *
  *                                                                            *
  * This program is free software: you can redistribute it and/or modify       *
@@ -30,44 +30,28 @@
  * -------------------------------------------------------------------------- */
 
 #include "HipArray.h"
+#include "HipFFTBase.h"
+
+#define VKFFT_BACKEND 2 // HIP
+#include "vkFFT.h"
 
 namespace OpenMM {
 
 /**
- * This class performs three dimensional Fast Fourier Transforms.  It is based on the
- * mixed radix algorithm described in
- * <p>
- * Takahashi, D. and Kanada, Y., "High-Performance Radix-2, 3 and 5 Parallel 1-D Complex
- * FFT Algorithms for Distributed-Memory Parallel Computers."  Journal of Supercomputing,
- * 15, 207–228 (2000).
- * <p>
- * This class places certain restrictions on the allowed dimensions of the grid.  First,
- * the size of each dimension may have no prime factors other than 2, 3, 5, and 7.  You
- * can call findLegalDimension() to determine the smallest size that satisfies this
- * requirement and is greater than or equal to a specified minimum size.  Second, the size
- * of each dimension must be small enough to compute each 1D transform entirely in local
- * memory with one work unit per data point.  This will vary between platforms, but is
- * typically at least 512.
+ * This class performs three dimensional Fast Fourier Transforms using VkFFT by
+ * Dmitrii Tolmachev (https://github.com/DTolm/VkFFT).
  * <p>
  * Note that this class performs an unnormalized transform.  That means that if you perform
  * a forward transform followed immediately by an inverse transform, the effect is to
  * multiply every value of the original data set by the total number of data points.
  */
 
-class OPENMM_EXPORT_COMMON HipFFT3D {
+class OPENMM_EXPORT_COMMON HipFFTImplVkFFT : public HipFFTBase {
 public:
     /**
-     * Create an HipFFT3D object for performing transforms of a particular size.
-     *
-     * @param context the context in which to perform calculations
-     * @param xsize   the first dimension of the data sets on which FFTs will be performed
-     * @param ysize   the second dimension of the data sets on which FFTs will be performed
-     * @param zsize   the third dimension of the data sets on which FFTs will be performed
-     * @param realToComplex  if true, a real-to-complex transform will be done.  Otherwise, it is complex-to-complex.
-     */
-    HipFFT3D(HipContext& context, int xsize, int ysize, int zsize, bool realToComplex=false);
-    /**
-     * Perform a Fourier transform.  The transform cannot be done in-place: the input and output
+     * Create an HipFFTImplVkFFT object for performing transforms of a particular size.
+     * <p>
+     * The transform cannot be done in-place: the input and output
      * arrays must be different.  Also, the input array is used as workspace, so its contents
      * are destroyed.  This also means that both arrays must be large enough to hold complex values,
      * even when performing a real-to-complex transform.
@@ -75,29 +59,38 @@ public:
      * When performing a real-to-complex transform, the output data is of size xsize*ysize*(zsize/2+1)
      * and contains only the non-redundant elements.
      *
-     * @param in       the data to transform, ordered such that in[x*ysize*zsize + y*zsize + z] contains element (x, y, z)
-     * @param out      on exit, this contains the transformed data
+     * @param context the context in which to perform calculations
+     * @param xsize   the first dimension of the data sets on which FFTs will be performed
+     * @param ysize   the second dimension of the data sets on which FFTs will be performed
+     * @param zsize   the third dimension of the data sets on which FFTs will be performed
+     * @param realToComplex  if true, a real-to-complex transform will be done.  Otherwise, it is complex-to-complex.
+     * @param stream  HIP stream
+     * @param in      the data to transform, ordered such that in[x*ysize*zsize + y*zsize + z] contains element (x, y, z)
+     * @param out     on exit, this contains the transformed data
+     */
+    HipFFTImplVkFFT(HipContext& context, int xsize, int ysize, int zsize, bool realToComplex, hipStream_t stream, HipArray& in, HipArray& out);
+    virtual ~HipFFTImplVkFFT();
+    /**
+     * Perform a Fourier transform.
+     *
      * @param forward  true to perform a forward transform, false to perform an inverse transform
      */
-    void execFFT(HipArray& in, HipArray& out, bool forward = true);
+    virtual void execFFT(bool forward);
     /**
      * Get the smallest legal size for a dimension of the grid (that is, a size with no prime
-     * factors other than 2, 3, 5, and 7).
+     * factors other than 2, 3, 5, 7, 11, 13).  VkFFT supports arbitrary sizes but they may work
+     * slower.
      *
      * @param minimum   the minimum size the return value must be greater than or equal to
      */
     static int findLegalDimension(int minimum);
 private:
-    hipFunction_t createKernel(int xsize, int ysize, int zsize, int& threads, int axis, bool forward, bool inputIsReal);
-    int xsize, ysize, zsize;
-    int xthreads, ythreads, zthreads;
-    bool packRealAsComplex;
-    HipContext& context;
-    hipFunction_t xkernel, ykernel, zkernel;
-    hipFunction_t invxkernel, invykernel, invzkernel;
-    hipFunction_t packForwardKernel, unpackForwardKernel, packBackwardKernel, unpackBackwardKernel;
+    VkFFTApplication* app;
+    int deviceIndex;
+    uint64_t inputBufferSize;
+    uint64_t outputBufferSize;
 };
 
 } // namespace OpenMM
 
-#endif // __OPENMM_HIPFFT3D_H__
+#endif // __OPENMM_HIPVKFFT_H__

@@ -11,7 +11,6 @@
  * Reserved.                                                                  *
  * Authors: Peter Eastman, Nicholas Curtis                                    *
  * Contributors:                                                              *
- * Portions Copyright© 2020 Advanced Micro Devices, Inc. All rights reserved  *
  *                                                                            *
  * Permission is hereby granted, free of charge, to any person obtaining a    *
  * copy of this software and associated documentation files (the "Software"), *
@@ -33,14 +32,17 @@
  * -------------------------------------------------------------------------- */
 
 /**
- * This tests the Hip implementation of sorting.
+ * This tests the Hip implementation of FFT.
  */
 
 #include "openmm/internal/AssertionUtilities.h"
 #include "HipArray.h"
 #include "HipContext.h"
-#include "HipFFT3D.h"
-#include "HipSort.h"
+#include "HipFFTImplFFT3D.h"
+#include "HipFFTImplVkFFT.h"
+#ifdef OPENMM_HIP_WITH_HIPFFT
+#include "HipFFTImplHipFFT.h"
+#endif
 #include "fftpack.h"
 #include "sfmt/SFMT.h"
 #include "openmm/System.h"
@@ -53,8 +55,12 @@ using namespace std;
 
 static HipPlatform platform;
 
-template <class Real2>
-void testTransform(bool realToComplex, int xsize, int ysize, int zsize) {
+template <class FFTImpl, class Real2>
+void testTransform(bool realToComplex, int xsize, int ysize, int zsize, double eps = 1) {
+    xsize = FFTImpl::findLegalDimension(xsize);
+    ysize = FFTImpl::findLegalDimension(ysize);
+    zsize = FFTImpl::findLegalDimension(zsize);
+    cout << "realToComplex: " << realToComplex << " xsize: " << xsize << " ysize: " << ysize << " zsize: " << zsize << endl;
     System system;
     system.addParticle(0.0);
     HipPlatform::PlatformData platformData(NULL, system, "", "true", platform.getPropertyDefaultValue("HipPrecision"), "false",
@@ -82,11 +88,11 @@ void testTransform(bool realToComplex, int xsize, int ysize, int zsize) {
     HipArray grid1(context, original.size(), sizeof(Real2), "grid1");
     HipArray grid2(context, original.size(), sizeof(Real2), "grid2");
     grid1.upload(original);
-    HipFFT3D fft(context, xsize, ysize, zsize, realToComplex);
+    FFTImpl fft(context, xsize, ysize, zsize, realToComplex, context.getCurrentStream(), grid1, grid2);
 
     // Perform a forward FFT, then verify the result is correct.
 
-    fft.execFFT(grid1, grid2, true);
+    fft.execFFT(true);
     vector<Real2> result;
     grid2.download(result);
     fftpack_t plan;
@@ -98,20 +104,61 @@ void testTransform(bool realToComplex, int xsize, int ysize, int zsize) {
             for (int z = 0; z < outputZSize; z++) {
                 int index1 = x*ysize*zsize + y*zsize + z;
                 int index2 = x*ysize*outputZSize + y*outputZSize + z;
-                ASSERT_EQUAL_TOL(reference[index1].re, result[index2].x, 1e-3);
-                ASSERT_EQUAL_TOL(reference[index1].im, result[index2].y, 1e-3);
+                ASSERT_EQUAL_TOL(reference[index1].re, result[index2].x, 1e-3 * eps);
+                ASSERT_EQUAL_TOL(reference[index1].im, result[index2].y, 1e-3 * eps);
             }
     fftpack_destroy(plan);
 
     // Perform a backward transform and see if we get the original values.
 
-    fft.execFFT(grid2, grid1, false);
+    fft.execFFT(false);
     grid1.download(result);
     double scale = 1.0/(xsize*ysize*zsize);
     int valuesToCheck = (realToComplex ? original.size()/2 : original.size());
     for (int i = 0; i < valuesToCheck; ++i) {
-        ASSERT_EQUAL_TOL(original[i].x, scale*result[i].x, 1e-4);
-        ASSERT_EQUAL_TOL(original[i].y, scale*result[i].y, 1e-4);
+        ASSERT_EQUAL_TOL(original[i].x, scale*result[i].x, 1e-4 * eps);
+        ASSERT_EQUAL_TOL(original[i].y, scale*result[i].y, 1e-4 * eps);
+    }
+}
+
+template <class FFTImpl>
+void runTest(const std::string& impl_name) {
+    cout << "Testing " << impl_name << endl;
+    if (platform.getPropertyDefaultValue("HipPrecision") == "double") {
+        testTransform<FFTImpl, double2>(false, 28, 25, 30);
+        testTransform<FFTImpl, double2>(true, 28, 25, 25);
+        testTransform<FFTImpl, double2>(true, 25, 28, 25);
+        testTransform<FFTImpl, double2>(true, 25, 25, 28);
+        testTransform<FFTImpl, double2>(true, 21, 25, 27);
+        testTransform<FFTImpl, double2>(true, 49, 98, 14);
+        testTransform<FFTImpl, double2>(true, 7, 21, 98);
+        testTransform<FFTImpl, double2>(true, 98, 21, 21);
+        testTransform<FFTImpl, double2>(true, 18, 98, 6);
+        testTransform<FFTImpl, double2>(true, 50, 50, 50);
+        testTransform<FFTImpl, double2>(true, 60, 60, 60);
+        testTransform<FFTImpl, double2>(false, 64, 64, 64);
+        testTransform<FFTImpl, double2>(false, 100, 140, 88);
+        testTransform<FFTImpl, double2>(true, 120, 243, 120);
+        testTransform<FFTImpl, double2>(true, 216, 216, 116);
+        testTransform<FFTImpl, double2>(true, 98, 98, 98);
+    }
+    else {
+        testTransform<FFTImpl, float2>(false, 28, 25, 30);
+        testTransform<FFTImpl, float2>(true, 28, 25, 25);
+        testTransform<FFTImpl, float2>(true, 25, 28, 25);
+        testTransform<FFTImpl, float2>(true, 25, 25, 28);
+        testTransform<FFTImpl, float2>(true, 21, 25, 27);
+        testTransform<FFTImpl, float2>(true, 49, 98, 14);
+        testTransform<FFTImpl, float2>(true, 7, 21, 98);
+        testTransform<FFTImpl, float2>(true, 98, 21, 21);
+        testTransform<FFTImpl, float2>(true, 18, 98, 6);
+        testTransform<FFTImpl, float2>(true, 50, 50, 50);
+        testTransform<FFTImpl, float2>(true, 60, 60, 60);
+        testTransform<FFTImpl, float2>(false, 64, 64, 64);
+        testTransform<FFTImpl, float2>(false, 100, 140, 88, 1e+1);
+        testTransform<FFTImpl, float2>(true, 120, 243, 120, 1e+1);
+        testTransform<FFTImpl, float2>(true, 216, 216, 116, 1e+1);
+        testTransform<FFTImpl, float2>(true, 98, 98, 98, 1e+1);
     }
 }
 
@@ -119,20 +166,11 @@ int main(int argc, char* argv[]) {
     try {
         if (argc > 1)
             platform.setPropertyDefaultValue("HipPrecision", string(argv[1]));
-        if (platform.getPropertyDefaultValue("HipPrecision") == "double") {
-            testTransform<double2>(false, 28, 25, 30);
-            testTransform<double2>(true, 28, 25, 25);
-            testTransform<double2>(true, 25, 28, 25);
-            testTransform<double2>(true, 25, 25, 28);
-            testTransform<double2>(true, 21, 25, 27);
-        }
-        else {
-            testTransform<float2>(false, 28, 25, 30);
-            testTransform<float2>(true, 28, 25, 25);
-            testTransform<float2>(true, 25, 28, 25);
-            testTransform<float2>(true, 25, 25, 28);
-            testTransform<float2>(true, 21, 25, 27);
-        }
+        runTest<HipFFTImplFFT3D>("HipFFTImplFFT3D");
+        runTest<HipFFTImplVkFFT>("HipFFTImplVkFFT");
+#ifdef OPENMM_HIP_WITH_HIPFFT
+        runTest<HipFFTImplHipFFT>("HipFFTImplHipFFT");
+#endif
     }
     catch(const exception& e) {
         cout << "exception: " << e.what() << endl;
