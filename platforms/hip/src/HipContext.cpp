@@ -77,7 +77,8 @@ bool HipContext::hasInitializedHip = false;
 HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSync, const string& precision, const string& compiler,
         const string& tempDir, const std::string& hostCompiler, HipPlatform::PlatformData& platformData, HipContext* originalContext) : ComputeContext(system), currentStream(0),
         platformData(platformData), contextIsValid(false), hasAssignedPosqCharges(false),
-        hasCompilerKernel(false), isHipccAvailable(false), pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL) {
+        hasCompilerKernel(false), isHipccAvailable(false), pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
+        supportsHardwareFloatGlobalAtomicAdd(false) {
     // Determine what compiler to use.
 
     this->compiler = "\""+compiler+"\"";
@@ -175,6 +176,14 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
     gpuArchitecture = props.gcnArchName;
     // HIP-TODO: find a good value here
     int numThreadBlocksPerComputeUnit = 6;
+
+    if (gpuArchitecture.find("gfx908") == 0 ||
+        gpuArchitecture.find("gfx90a") == 0 ||
+        gpuArchitecture.find("gfx94") == 0) {
+        // MI100 and newer CDNA support 32 bit float atomic add
+        // HIP-TODO: evaluate performance on RDNA 3 (gfx11* and gfx12*), where it's supported too
+        this->supportsHardwareFloatGlobalAtomicAdd = true;
+    }
 
     contextIsValid = true;
     if (contextIndex > 0) {
@@ -422,7 +431,7 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
     const char* saveTempsEnv = getenv("OPENMM_SAVE_TEMPS");
     bool saveTemps = saveTempsEnv != nullptr;
     string bits = intToString(8*sizeof(void*));
-    string options = "-ffast-math -Wall";
+    string options = "-ffast-math -munsafe-fp-atomics -Wall";
     if (gpuArchitecture.find("gfx90a") == 0 ||
         gpuArchitecture.find("gfx94") == 0) {
         // HIP-TODO: Remove it when the compiler does a better job
