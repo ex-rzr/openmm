@@ -6,8 +6,8 @@
  * Biological Structures at Stanford, funded under the NIH Roadmap for        *
  * Medical Research, grant U54 GM072970. See https://simtk.org.               *
  *                                                                            *
- * Portions copyright (c) 2012-2019 Stanford University and the Authors.      *
- * Portions copyright (C) 2020 Advanced Micro Devices, Inc. All Rights        *
+ * Portions copyright (c) 2012-2022 Stanford University and the Authors.      *
+ * Portions copyright (C) 2020-2022 Advanced Micro Devices, Inc. All Rights   *
  * Reserved.                                                                  *
  * Authors: Peter Eastman, Nicholas Curtis                                    *
  * Contributors:                                                              *
@@ -28,6 +28,7 @@
 
 #include "HipArray.h"
 #include "HipContext.h"
+#include "openmm/common/ContextSelector.h"
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -37,13 +38,13 @@ using namespace OpenMM;
 HipArray::HipArray() : pointer(0), ownsMemory(false) {
 }
 
-HipArray::HipArray(HipContext& context, int size, int elementSize, const std::string& name) : pointer(0) {
+HipArray::HipArray(HipContext& context, size_t size, int elementSize, const std::string& name) : pointer(0) {
     initialize(context, size, elementSize, name);
 }
 
 HipArray::~HipArray() {
     if (pointer != 0 && ownsMemory && context->getContextIsValid()) {
-        context->setAsCurrent();
+        ContextSelector selector(*context);
         hipError_t result = hipFree(pointer);
         if (result != hipSuccess) {
             std::stringstream str;
@@ -53,7 +54,7 @@ HipArray::~HipArray() {
     }
 }
 
-void HipArray::initialize(ComputeContext& context, int size, int elementSize, const std::string& name) {
+void HipArray::initialize(ComputeContext& context, size_t size, int elementSize, const std::string& name) {
     if (this->pointer != 0)
         throw OpenMMException("HipArray has already been initialized");
     this->context = &dynamic_cast<HipContext&>(context);
@@ -61,6 +62,7 @@ void HipArray::initialize(ComputeContext& context, int size, int elementSize, co
     this->elementSize = elementSize;
     this->name = name;
     ownsMemory = true;
+    ContextSelector selector(*this->context);
     hipError_t result = hipMalloc(&pointer, size*elementSize);
     if (result != hipSuccess) {
         std::stringstream str;
@@ -69,11 +71,12 @@ void HipArray::initialize(ComputeContext& context, int size, int elementSize, co
     }
 }
 
-void HipArray::resize(int size) {
+void HipArray::resize(size_t size) {
     if (pointer == 0)
         throw OpenMMException("HipArray has not been initialized");
     if (!ownsMemory)
         throw OpenMMException("Cannot resize an array that does not own its storage");
+    ContextSelector selector(*context);
     hipError_t result = hipFree(pointer);
     if (result != hipSuccess) {
         std::stringstream str;

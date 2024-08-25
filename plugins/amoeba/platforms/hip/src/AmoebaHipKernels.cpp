@@ -6,7 +6,7 @@
  * Biological Structures at Stanford, funded under the NIH Roadmap for        *
  * Medical Research, grant U54 GM072970. See https://simtk.org.               *
  *                                                                            *
- * Portions copyright (c) 2008-2020 Stanford University and the Authors.      *
+ * Portions copyright (c) 2008-2021 Stanford University and the Authors.      *
  * Portions copyright (c) 2021 Advanced Micro Devices, Inc. All Rights        *
  * Reserved.                                                                  *
  * Authors: Peter Eastman, Mark Friedrichs                                    *
@@ -30,6 +30,7 @@
   #define _USE_MATH_DEFINES // Needed to get M_PI
 #endif
 #include "AmoebaHipKernels.h"
+#include "openmm/common/ContextSelector.h"
 #include "openmm/internal/ContextImpl.h"
 #include "openmm/internal/AmoebaGeneralizedKirkwoodForceImpl.h"
 #include "openmm/internal/AmoebaMultipoleForceImpl.h"
@@ -57,7 +58,7 @@ using namespace std;
  * -------------------------------------------------------------------------- */
 
 HipCalcAmoebaMultipoleForceKernel::~HipCalcAmoebaMultipoleForceKernel() {
-    cc.setAsCurrent();
+    ContextSelector selector(cc);
     if (fft != NULL)
         delete fft;
 }
@@ -65,6 +66,7 @@ HipCalcAmoebaMultipoleForceKernel::~HipCalcAmoebaMultipoleForceKernel() {
 void HipCalcAmoebaMultipoleForceKernel::initialize(const System& system, const AmoebaMultipoleForce& force) {
     CommonCalcAmoebaMultipoleForceKernel::initialize(system, force);
     if (usePME) {
+        ContextSelector selector(cc);
         HipArray& grid1 = cu.unwrap(pmeGrid1);
         HipArray& grid2 = cu.unwrap(pmeGrid2);
         fft = cu.createFFT(gridSizeX, gridSizeY, gridSizeZ, false, cu.getCurrentStream(), grid1, grid2);
@@ -80,7 +82,7 @@ void HipCalcAmoebaMultipoleForceKernel::computeFFT(bool forward) {
  * -------------------------------------------------------------------------- */
 
 HipCalcHippoNonbondedForceKernel::~HipCalcHippoNonbondedForceKernel() {
-    cc.setAsCurrent();
+    ContextSelector selector(cc);
     if (sort != NULL)
         delete sort;
     if (fft != NULL)
@@ -92,6 +94,7 @@ HipCalcHippoNonbondedForceKernel::~HipCalcHippoNonbondedForceKernel() {
 void HipCalcHippoNonbondedForceKernel::initialize(const System& system, const HippoNonbondedForce& force) {
     CommonCalcHippoNonbondedForceKernel::initialize(system, force);
     if (usePME) {
+        ContextSelector selector(cc);
         sort = new HipSort(cu, new SortTrait(), cc.getNumAtoms());
         HipArray& grid1 = cu.unwrap(pmeGrid1);
         HipArray& grid2 = cu.unwrap(pmeGrid2);
