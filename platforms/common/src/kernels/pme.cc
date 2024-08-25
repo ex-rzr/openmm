@@ -20,9 +20,6 @@ KERNEL void findAtomGridIndex(GLOBAL const real4* RESTRICT posq, GLOBAL int2* RE
     }
 }
 
-#if defined(USE_HIP) && !defined(AMD_RDNA)
-LAUNCH_BOUNDS_EXACT(128, 1)
-#endif
 KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
 #ifdef USE_FIXED_POINT_CHARGE_SPREADING
         GLOBAL mm_ulong* RESTRICT pmeGrid,
@@ -37,10 +34,6 @@ KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
         GLOBAL const real* RESTRICT charges
 #endif
         ) {
-// HIP-TODO: Workaround for RDNA, remove it when the compiler issue is fixed
-#if defined(USE_HIP)
-    (void)GLOBAL_ID;
-#endif
     // To improve memory efficiency, we divide indices along the z axis into
     // PME_ORDER blocks, where the data for each block is stored together.  We
     // can ensure that all threads write to the same block at the same time,
@@ -137,10 +130,6 @@ KERNEL void finishSpreadCharge(
         GLOBAL const real* RESTRICT grid1,
 #endif
         GLOBAL real* RESTRICT grid2) {
-// HIP-TODO: Workaround for RDNA, remove it when the compiler issue is fixed
-#if defined(USE_HIP)
-    (void)GLOBAL_ID;
-#endif
     // During charge spreading, we shuffled the order of indices along the z
     // axis to make memory access more efficient.  We now need to unshuffle
     // them.  If the values were accumulated as fixed point, we also need to
@@ -282,9 +271,6 @@ KERNEL void gridEvaluateEnergy(GLOBAL real2* RESTRICT pmeGrid, GLOBAL mixed* RES
 #endif
 }
 
-#if defined(USE_HIP) && !defined(AMD_RDNA) && !defined(USE_DOUBLE_PRECISION)
-LAUNCH_BOUNDS_EXACT(128, 1)
-#endif
 KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL const real* RESTRICT pmeGrid,
         real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ, GLOBAL const int2* RESTRICT pmeAtomGridIndex,
