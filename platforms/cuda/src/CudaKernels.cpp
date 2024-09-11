@@ -431,6 +431,7 @@ void CudaCalcNonbondedForceKernel::initialize(const System& system, const Nonbon
                 pmeDefines["USE_FIXED_POINT_CHARGE_SPREADING"] = "1";
             if (usePmeStream)
                 pmeDefines["USE_PME_STREAM"] = "1";
+            pmeDefines["ENABLE_SHUFFLE"] = "1";
             map<string, string> replacements;
             replacements["CHARGE"] = (usePosqCharges ? "pos.w" : "charges[atom]");
             CUmodule module = cu.createModule(CudaKernelSources::vectorOps+cu.replaceStrings(CommonKernelSources::pme, replacements), pmeDefines);
@@ -890,6 +891,10 @@ double CudaCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeF
 
         // Execute the reciprocal space kernels.
 
+        const int pmeThreadBlockSize = 128;
+        const int pmeAtomsPerBlock = (cu.getSIMDWidth() / PmeOrder) * (pmeThreadBlockSize / cu.getSIMDWidth());
+        const int pmeNumThreadBlocks = (cu.getNumAtoms() + pmeAtomsPerBlock - 1) / pmeAtomsPerBlock;
+
         if (hasCoulomb) {
             void* gridIndexArgs[] = {&cu.getPosq().getDevicePointer(), &pmeAtomGridIndex.getDevicePointer(), cu.getPeriodicBoxSizePointer(),
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
@@ -902,8 +907,9 @@ double CudaCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeF
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2], &pmeAtomGridIndex.getDevicePointer(),
                     &charges.getDevicePointer()};
-            cu.executeKernel(pmeSpreadChargeKernel, spreadArgs, cu.getNumAtoms(), 128);
+            cu.executeKernel(pmeSpreadChargeKernel, spreadArgs, pmeNumThreadBlocks * pmeThreadBlockSize, pmeThreadBlockSize);
 
+            // TODO: Not needed if !USE_FIXED_POINT_CHARGE_SPREADING, pmeSpreadChargeKernel can write directly to pmeGrid1
             void* finishSpreadArgs[] = {&pmeGrid2.getDevicePointer(), &pmeGrid1.getDevicePointer()};
             cu.executeKernel(pmeFinishSpreadChargeKernel, finishSpreadArgs, gridSizeX*gridSizeY*gridSizeZ, 256);
 
@@ -953,7 +959,7 @@ double CudaCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeF
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2], &pmeAtomGridIndex.getDevicePointer(),
                     &charges.getDevicePointer()};
-            cu.executeKernel(pmeInterpolateForceKernel, interpolateArgs, cu.getNumAtoms(), 128);
+            cu.executeKernel(pmeInterpolateForceKernel, interpolateArgs, pmeNumThreadBlocks * pmeThreadBlockSize, pmeThreadBlockSize);
         }
 
         if (doLJPME && hasLJ) {
@@ -972,7 +978,7 @@ double CudaCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeF
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2], &pmeAtomGridIndex.getDevicePointer(),
                     &sigmaEpsilon.getDevicePointer()};
-            cu.executeKernel(pmeDispersionSpreadChargeKernel, spreadArgs, cu.getNumAtoms(), 128);
+            cu.executeKernel(pmeDispersionSpreadChargeKernel, spreadArgs, pmeNumThreadBlocks * pmeThreadBlockSize, pmeThreadBlockSize);
 
             void* finishSpreadArgs[] = {&pmeGrid2.getDevicePointer(), &pmeGrid1.getDevicePointer()};
             cu.executeKernel(pmeDispersionFinishSpreadChargeKernel, finishSpreadArgs, dispersionGridSizeX*dispersionGridSizeY*dispersionGridSizeZ, 256);
@@ -1023,7 +1029,7 @@ double CudaCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeF
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2], &pmeAtomGridIndex.getDevicePointer(),
                     &sigmaEpsilon.getDevicePointer()};
-            cu.executeKernel(pmeInterpolateDispersionForceKernel, interpolateArgs, cu.getNumAtoms(), 128);
+            cu.executeKernel(pmeInterpolateDispersionForceKernel, interpolateArgs, pmeNumThreadBlocks * pmeThreadBlockSize, pmeThreadBlockSize);
         }
         if (usePmeStream) {
             cuEventRecord(pmeSyncEvent, pmeStream);

@@ -422,6 +422,7 @@ void HipCalcNonbondedForceKernel::initialize(const System& system, const Nonbond
                 pmeDefines["USE_FIXED_POINT_CHARGE_SPREADING"] = "1";
             if (usePmeStream)
                 pmeDefines["USE_PME_STREAM"] = "1";
+            pmeDefines["ENABLE_SHUFFLE"] = "1";
             map<string, string> replacements;
             replacements["CHARGE"] = (usePosqCharges ? "pos.w" : "charges[atom]");
             hipModule_t module = cu.createModule(HipKernelSources::vectorOps+cu.replaceStrings(CommonKernelSources::pme, replacements), pmeDefines);
@@ -850,6 +851,10 @@ double HipCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeFo
 
         // Execute the reciprocal space kernels.
 
+        const int pmeThreadBlockSize = 128;
+        const int pmeAtomsPerBlock = (cu.getSIMDWidth() / PmeOrder) * (pmeThreadBlockSize / cu.getSIMDWidth());
+        const int pmeNumThreadBlocks = (cu.getNumAtoms() + pmeAtomsPerBlock - 1) / pmeAtomsPerBlock;
+
         if (hasCoulomb) {
             void* gridIndexArgs[] = {&cu.getPosq().getDevicePointer(), &pmeAtomGridIndex.getDevicePointer(), cu.getPeriodicBoxSizePointer(),
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
@@ -862,8 +867,9 @@ double HipCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeFo
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2], &pmeAtomGridIndex.getDevicePointer(),
                     &charges.getDevicePointer()};
-            cu.executeKernelFlat(pmeSpreadChargeKernel, spreadArgs, cu.getNumAtoms(), 128);
+            cu.executeKernelFlat(pmeSpreadChargeKernel, spreadArgs, pmeNumThreadBlocks * pmeThreadBlockSize, pmeThreadBlockSize);
 
+            // TODO: Not needed if !USE_FIXED_POINT_CHARGE_SPREADING, pmeSpreadChargeKernel can write directly to pmeGrid1
             void* finishSpreadArgs[] = {&pmeGrid2.getDevicePointer(), &pmeGrid1.getDevicePointer()};
             cu.executeKernelFlat(pmeFinishSpreadChargeKernel, finishSpreadArgs, gridSizeX*gridSizeY*gridSizeZ, 256);
 
@@ -879,7 +885,7 @@ double HipCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeFo
             void* convolutionArgs[] = {&pmeGrid2.getDevicePointer(), &pmeBsplineModuliX.getDevicePointer(),
                     &pmeBsplineModuliY.getDevicePointer(), &pmeBsplineModuliZ.getDevicePointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
-            cu.executeKernel(pmeConvolutionKernel, convolutionArgs, gridSizeX*gridSizeY*gridSizeZ, 256);
+            cu.executeKernelFlat(pmeConvolutionKernel, convolutionArgs, gridSizeX*gridSizeY*gridSizeZ, 256);
 
             fft->execFFT(false);
 
@@ -887,7 +893,7 @@ double HipCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeFo
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2], &pmeAtomGridIndex.getDevicePointer(),
                     &charges.getDevicePointer()};
-            cu.executeKernel(pmeInterpolateForceKernel, interpolateArgs, cu.getNumAtoms(), 128);
+            cu.executeKernelFlat(pmeInterpolateForceKernel, interpolateArgs, pmeNumThreadBlocks * pmeThreadBlockSize, pmeThreadBlockSize);
         }
 
         if (doLJPME && hasLJ) {
@@ -906,7 +912,7 @@ double HipCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeFo
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2], &pmeAtomGridIndex.getDevicePointer(),
                     &sigmaEpsilon.getDevicePointer()};
-            cu.executeKernelFlat(pmeDispersionSpreadChargeKernel, spreadArgs, cu.getNumAtoms(), 128);
+            cu.executeKernelFlat(pmeDispersionSpreadChargeKernel, spreadArgs, pmeNumThreadBlocks * pmeThreadBlockSize, pmeThreadBlockSize);
 
             void* finishSpreadArgs[] = {&pmeGrid2.getDevicePointer(), &pmeGrid1.getDevicePointer()};
             cu.executeKernelFlat(pmeDispersionFinishSpreadChargeKernel, finishSpreadArgs, dispersionGridSizeX*dispersionGridSizeY*dispersionGridSizeZ, 256);
@@ -923,7 +929,7 @@ double HipCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeFo
             void* convolutionArgs[] = {&pmeGrid2.getDevicePointer(), &pmeDispersionBsplineModuliX.getDevicePointer(),
                     &pmeDispersionBsplineModuliY.getDevicePointer(), &pmeDispersionBsplineModuliZ.getDevicePointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2]};
-            cu.executeKernel(pmeDispersionConvolutionKernel, convolutionArgs, dispersionGridSizeX*dispersionGridSizeY*dispersionGridSizeZ, 256);
+            cu.executeKernelFlat(pmeDispersionConvolutionKernel, convolutionArgs, dispersionGridSizeX*dispersionGridSizeY*dispersionGridSizeZ, 256);
 
             dispersionFft->execFFT(false);
 
@@ -931,7 +937,7 @@ double HipCalcNonbondedForceKernel::execute(ContextImpl& context, bool includeFo
                     cu.getInvPeriodicBoxSizePointer(), cu.getPeriodicBoxVecXPointer(), cu.getPeriodicBoxVecYPointer(), cu.getPeriodicBoxVecZPointer(),
                     recipBoxVectorPointer[0], recipBoxVectorPointer[1], recipBoxVectorPointer[2], &pmeAtomGridIndex.getDevicePointer(),
                     &sigmaEpsilon.getDevicePointer()};
-            cu.executeKernel(pmeInterpolateDispersionForceKernel, interpolateArgs, cu.getNumAtoms(), 128);
+            cu.executeKernelFlat(pmeInterpolateDispersionForceKernel, interpolateArgs, pmeNumThreadBlocks * pmeThreadBlockSize, pmeThreadBlockSize);
         }
         if (usePmeStream) {
             hipEventRecord(pmeSyncEvent, pmeStream);

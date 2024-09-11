@@ -1,3 +1,10 @@
+#if defined(__CUDA_ARCH__)
+#define SHFL_REAL(mask, var, srcLane) __shfl_sync(mask, var, srcLane)
+#elif defined(USE_HIP)
+// SHFL cannot be used because it works with tiles and TILE_SIZE != warpSize on CDNA
+#define SHFL_REAL(mask, var, srcLane) __shfl(var, srcLane)
+#endif
+
 KERNEL void findAtomGridIndex(GLOBAL const real4* RESTRICT posq, GLOBAL int2* RESTRICT pmeAtomGridIndex,
         real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ
@@ -20,9 +27,8 @@ KERNEL void findAtomGridIndex(GLOBAL const real4* RESTRICT posq, GLOBAL int2* RE
     }
 }
 
-#if defined(USE_HIP) && !defined(AMD_RDNA)
-LAUNCH_BOUNDS_EXACT(128, 1)
-#endif
+#if !defined(ENABLE_SHUFFLE)
+
 KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
 #ifdef USE_FIXED_POINT_CHARGE_SPREADING
         GLOBAL mm_ulong* RESTRICT pmeGrid,
@@ -37,10 +43,6 @@ KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
         GLOBAL const real* RESTRICT charges
 #endif
         ) {
-// HIP-TODO: Workaround for RDNA, remove it when the compiler issue is fixed
-#if defined(USE_HIP)
-    (void)GLOBAL_ID;
-#endif
     // To improve memory efficiency, we divide indices along the z axis into
     // PME_ORDER blocks, where the data for each block is stored together.  We
     // can ensure that all threads write to the same block at the same time,
@@ -137,10 +139,6 @@ KERNEL void finishSpreadCharge(
         GLOBAL const real* RESTRICT grid1,
 #endif
         GLOBAL real* RESTRICT grid2) {
-// HIP-TODO: Workaround for RDNA, remove it when the compiler issue is fixed
-#if defined(USE_HIP)
-    (void)GLOBAL_ID;
-#endif
     // During charge spreading, we shuffled the order of indices along the z
     // axis to make memory access more efficient.  We now need to unshuffle
     // them.  If the values were accumulated as fixed point, we also need to
@@ -165,6 +163,8 @@ KERNEL void finishSpreadCharge(
 #endif
     }
 }
+
+#endif
 
 KERNEL void reciprocalConvolution(GLOBAL real2* RESTRICT pmeGrid, GLOBAL const real* RESTRICT pmeBsplineModuliX,
         GLOBAL const real* RESTRICT pmeBsplineModuliY, GLOBAL const real* RESTRICT pmeBsplineModuliZ,
@@ -282,9 +282,8 @@ KERNEL void gridEvaluateEnergy(GLOBAL real2* RESTRICT pmeGrid, GLOBAL mixed* RES
 #endif
 }
 
-#if defined(USE_HIP) && !defined(AMD_RDNA) && !defined(USE_DOUBLE_PRECISION)
-LAUNCH_BOUNDS_EXACT(128, 1)
-#endif
+#if !defined(ENABLE_SHUFFLE)
+
 KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL const real* RESTRICT pmeGrid,
         real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ, GLOBAL const int2* RESTRICT pmeAtomGridIndex,
@@ -386,6 +385,8 @@ KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ul
     }
 }
 
+#endif
+
 KERNEL void addForces(GLOBAL const real4* RESTRICT forces, GLOBAL mm_long* RESTRICT forceBuffers) {
     for (int atom = GLOBAL_ID; atom < NUM_ATOMS; atom += GLOBAL_SIZE) {
         real4 f = forces[atom];
@@ -399,3 +400,283 @@ KERNEL void addEnergy(GLOBAL const mixed* RESTRICT pmeEnergyBuffer, GLOBAL mixed
     for (int i = GLOBAL_ID; i < bufferSize; i += GLOBAL_SIZE)
         energyBuffer[i] += pmeEnergyBuffer[i];
 }
+
+#if defined(ENABLE_SHUFFLE)
+
+KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
+#ifdef USE_FIXED_POINT_CHARGE_SPREADING
+        GLOBAL mm_ulong* RESTRICT pmeGrid,
+#else
+        GLOBAL real* RESTRICT pmeGrid,
+#endif
+        real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ, GLOBAL const int2* RESTRICT pmeAtomGridIndex,
+#ifdef CHARGE_FROM_SIGEPS
+        GLOBAL const float2* RESTRICT sigmaEpsilon
+#else
+        GLOBAL const real* RESTRICT charges
+#endif
+        ) {
+    // Process the atoms in spatially sorted order.  This improves efficiency when writing
+    // the grid values.  PME_ORDER lanes process one atom.
+
+    const real scale = RECIP((real) (PME_ORDER-1));
+    const int lanesPerAtom = PME_ORDER;
+    const int atomsPerWarp = warpSize / lanesPerAtom;
+    const int atomsPerBlock = atomsPerWarp * (LOCAL_SIZE / warpSize);
+    const int warpInBlock = LOCAL_ID / warpSize;
+    const int laneId = LOCAL_ID % warpSize;
+    const int atomInWarp = laneId / lanesPerAtom;
+    const int atomStartLane = atomInWarp * lanesPerAtom;
+    const int laneInAtom = laneId % lanesPerAtom;
+
+    if (atomInWarp >= atomsPerWarp)
+        return;
+    const unsigned int mask = ((1u << lanesPerAtom) - 1) << (atomInWarp * lanesPerAtom);
+    for (int atomi = GROUP_ID*atomsPerBlock + warpInBlock*atomsPerWarp + atomInWarp; atomi < NUM_ATOMS; atomi += NUM_GROUPS*atomsPerBlock) {
+        int atom = pmeAtomGridIndex[atomi].x;
+        real4 pos = posq[atom];
+#ifdef CHARGE_FROM_SIGEPS
+        const float2 sigEps = sigmaEpsilon[atom];
+        const real charge = 8*sigEps.x*sigEps.x*sigEps.x*sigEps.y;
+#else
+        const real charge = (CHARGE)*EPSILON_FACTOR;
+#endif
+        APPLY_PERIODIC_TO_POS(pos)
+        real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
+                             pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
+                             pos.z*recipBoxVecZ.z);
+        t.x = (t.x-floor(t.x))*GRID_SIZE_X;
+        t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
+        t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
+        int3 gridIndex = make_int3(((int) t.x) % GRID_SIZE_X,
+                                   ((int) t.y) % GRID_SIZE_Y,
+                                   ((int) t.z) % GRID_SIZE_Z);
+        if (charge == 0)
+            continue;
+
+        // Since we need the full set of thetas, it's faster to compute them here than load them
+        // from global memory.
+        // One lane calculates thetas for one dimension (lane 0 - x, 1 - y, 2 - z), then all lanes
+        // of the atom read these values using __shfl.
+
+        real d[PME_ORDER];
+        real t0 = (laneInAtom == 0 ? t.x : (laneInAtom == 1 ? t.y : t.z));
+        real dr = t0-(int) t0;
+        d[PME_ORDER-1] = 0;
+        d[1] = dr;
+        d[0] = 1-dr;
+        for (int j = 3; j < PME_ORDER; j++) {
+            real div = RECIP((real) (j-1));
+            d[j-1] = div*dr*d[j-2];
+            for (int k = 1; k < (j-1); k++)
+                d[j-k-1] = div*((dr+k)*d[j-k-2] + (j-k-dr)*d[j-k-1]);
+            d[0] = div*(1-dr)*d[0];
+        }
+        d[PME_ORDER-1] = scale*dr*d[PME_ORDER-2];
+        for (int j = 1; j < (PME_ORDER-1); j++)
+            d[PME_ORDER-j-1] = scale*((dr+j)*d[PME_ORDER-j-2] + (PME_ORDER-j-dr)*d[PME_ORDER-j-1]);
+        d[0] = scale*(1-dr)*d[0];
+
+        real3 data[PME_ORDER];
+        for (int i = 0; i < PME_ORDER; i++) {
+            data[i] = make_real3(SHFL_REAL(mask, d[i], atomStartLane + 0),
+                                 SHFL_REAL(mask, d[i], atomStartLane + 1),
+                                 SHFL_REAL(mask, d[i], atomStartLane + 2));
+        }
+
+        // Spread the charge from this atom onto each grid point.  PME_ORDER lanes access
+        // consecutive addresses.
+
+        int iz = laneInAtom;
+        int zindex = gridIndex.z+iz;
+        zindex -= (zindex >= GRID_SIZE_Z ? GRID_SIZE_Z : 0);
+        real dz = 0;
+        for (int i = 0; i < PME_ORDER; i++) {
+            dz = i == iz ? data[i].z : dz;
+        }
+        for (int ix = 0; ix < PME_ORDER; ix++) {
+            int xbase = gridIndex.x+ix;
+            xbase -= (xbase >= GRID_SIZE_X ? GRID_SIZE_X : 0);
+            xbase = xbase*GRID_SIZE_Y*GRID_SIZE_Z;
+            real dx = charge*data[ix].x;
+            for (int iy = 0; iy < PME_ORDER; iy++) {
+                int ybase = gridIndex.y+iy;
+                ybase -= (ybase >= GRID_SIZE_Y ? GRID_SIZE_Y : 0);
+                ybase = xbase + ybase*GRID_SIZE_Z;
+                real dxdy = dx*data[iy].y;
+                int index = ybase + zindex;
+                real add = dxdy*dz;
+#ifdef USE_FIXED_POINT_CHARGE_SPREADING
+                ATOMIC_ADD(&pmeGrid[index], (mm_ulong) realToFixedPoint(add));
+#else
+                ATOMIC_ADD(&pmeGrid[index], add);
+#endif
+            }
+        }
+    }
+}
+
+KERNEL void finishSpreadCharge(
+#ifdef USE_FIXED_POINT_CHARGE_SPREADING
+        GLOBAL const mm_long* RESTRICT grid1,
+#else
+        GLOBAL const real* RESTRICT grid1,
+#endif
+        GLOBAL real* RESTRICT grid2) {
+    const unsigned int gridSize = GRID_SIZE_X*GRID_SIZE_Y*GRID_SIZE_Z;
+    real scale = 1/(real) 0x100000000;
+    for (int index = GLOBAL_ID; index < gridSize; index += GLOBAL_SIZE) {
+#ifdef USE_FIXED_POINT_CHARGE_SPREADING
+        grid2[index] = scale*grid1[index];
+#else
+        grid2[index] = grid1[index];
+#endif
+    }
+}
+
+KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL const real* RESTRICT pmeGrid,
+        real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ, GLOBAL const int2* RESTRICT pmeAtomGridIndex,
+#ifdef CHARGE_FROM_SIGEPS
+        GLOBAL const float2* RESTRICT sigmaEpsilon
+#else
+        GLOBAL const real* RESTRICT charges
+#endif
+        ) {
+    const real scale = RECIP((real) (PME_ORDER-1));
+
+    // Process the atoms in spatially sorted order.  This improves cache performance when loading
+    // the grid values.  PME_ORDER lanes process one atom.
+
+    const int lanesPerAtom = PME_ORDER;
+    const int atomsPerWarp = warpSize / lanesPerAtom;
+    const int atomsPerBlock = atomsPerWarp * (LOCAL_SIZE / warpSize);
+    const int warpInBlock = LOCAL_ID / warpSize;
+    const int laneId = LOCAL_ID % warpSize;
+    const int atomInWarp = laneId / lanesPerAtom;
+    const int atomStartLane = atomInWarp * lanesPerAtom;
+    const int laneInAtom = laneId % lanesPerAtom;
+
+    if (atomInWarp >= atomsPerWarp)
+        return;
+    const unsigned int mask = ((1u << lanesPerAtom) - 1) << (atomInWarp * lanesPerAtom);
+    for (int atomi = GROUP_ID*atomsPerBlock + warpInBlock*atomsPerWarp + atomInWarp; atomi < NUM_ATOMS; atomi += NUM_GROUPS*atomsPerBlock) {
+        int atom = pmeAtomGridIndex[atomi].x;
+        real4 pos = posq[atom];
+#ifdef CHARGE_FROM_SIGEPS
+        const float2 sigEps = sigmaEpsilon[atom];
+        const real charge = 8*sigEps.x*sigEps.x*sigEps.x*sigEps.y;
+#else
+        const real charge = (CHARGE)*EPSILON_FACTOR;
+#endif
+        if (charge == 0)
+            continue;
+        APPLY_PERIODIC_TO_POS(pos)
+        real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
+                             pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
+                             pos.z*recipBoxVecZ.z);
+        t.x = (t.x-floor(t.x))*GRID_SIZE_X;
+        t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
+        t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
+        int3 gridIndex = make_int3(((int) t.x) % GRID_SIZE_X,
+                                   ((int) t.y) % GRID_SIZE_Y,
+                                   ((int) t.z) % GRID_SIZE_Z);
+
+        // Since we need the full set of thetas, it's faster to compute them here than load them
+        // from global memory.
+        // One lane calculates thetas for one dimension (lane 0 - x, 1 - y, 2 - z), then all lanes
+        // of the atom read these values using __shfl.
+
+        real d[PME_ORDER];
+        real dd[PME_ORDER];
+        real t0 = (laneInAtom == 0 ? t.x : (laneInAtom == 1 ? t.y : t.z));
+        real dr = t0-(int) t0;
+        d[PME_ORDER-1] = 0;
+        d[1] = dr;
+        d[0] = 1-dr;
+        for (int j = 3; j < PME_ORDER; j++) {
+            real div = RECIP((real) (j-1));
+            d[j-1] = div*dr*d[j-2];
+            for (int k = 1; k < (j-1); k++)
+                d[j-k-1] = div*((dr+k)*d[j-k-2] + (j-k-dr)*d[j-k-1]);
+            d[0] = div*(1-dr)*d[0];
+        }
+        dd[0] = -d[0];
+        for (int j = 1; j < PME_ORDER; j++)
+            dd[j] = d[j-1]-d[j];
+        d[PME_ORDER-1] = scale*dr*d[PME_ORDER-2];
+        for (int j = 1; j < (PME_ORDER-1); j++)
+            d[PME_ORDER-j-1] = scale*((dr+j)*d[PME_ORDER-j-2] + (PME_ORDER-j-dr)*d[PME_ORDER-j-1]);
+        d[0] = scale*(1-dr)*d[0];
+
+        real3 data[PME_ORDER];
+        real3 ddata[PME_ORDER];
+        for (int i = 0; i < PME_ORDER; i++) {
+            data[i] = make_real3(SHFL_REAL(mask, d[i], atomStartLane + 0),
+                                 SHFL_REAL(mask, d[i], atomStartLane + 1),
+                                 SHFL_REAL(mask, d[i], atomStartLane + 2));
+            ddata[i] = make_real3(SHFL_REAL(mask, dd[i], atomStartLane + 0),
+                                  SHFL_REAL(mask, dd[i], atomStartLane + 1),
+                                  SHFL_REAL(mask, dd[i], atomStartLane + 2));
+        }
+
+        // Compute the force on this atom.  PME_ORDER lanes access consecutive addresses.
+
+        real3 force = make_real3(0);
+        int iz = laneInAtom;
+        int zindex = gridIndex.z+iz;
+        zindex -= (zindex >= GRID_SIZE_Z ? GRID_SIZE_Z : 0);
+        real dz = 0;
+        real ddz = 0;
+        for (int i = 0; i < PME_ORDER; i++) {
+            dz = i == iz ? data[i].z : dz;
+            ddz = i == iz ? ddata[i].z : ddz;
+        }
+        for (int ix = 0; ix < PME_ORDER; ix++) {
+            int xbase = gridIndex.x+ix;
+            xbase -= (xbase >= GRID_SIZE_X ? GRID_SIZE_X : 0);
+            xbase = xbase*GRID_SIZE_Y*GRID_SIZE_Z;
+            real dx = data[ix].x;
+            real ddx = ddata[ix].x;
+            for (int iy = 0; iy < PME_ORDER; iy++) {
+                int ybase = gridIndex.y+iy;
+                ybase -= (ybase >= GRID_SIZE_Y ? GRID_SIZE_Y : 0);
+                ybase = xbase + ybase*GRID_SIZE_Z;
+                real dy = data[iy].y;
+                real ddy = ddata[iy].y;
+                int index = ybase + zindex;
+                real gridvalue = pmeGrid[index];
+                force.x += ddx*dy*gridvalue;
+                force.y += dx*ddy*gridvalue;
+                force.z += dx*dy*gridvalue;
+            }
+        }
+        force.x *= dz;
+        force.y *= dz;
+        force.z *= ddz;
+
+        // Sum forces of all lanes of the current atom and write each component by one lane.
+
+        real3 f = force;
+        force = make_real3(0);
+        for (int i = 0; i < PME_ORDER; i++) {
+            force += make_real3(SHFL_REAL(mask, f.x, atomStartLane + i),
+                                SHFL_REAL(mask, f.y, atomStartLane + i),
+                                SHFL_REAL(mask, f.z, atomStartLane + i));
+        }
+        real forceX = force.x*GRID_SIZE_X*recipBoxVecX.x;
+        real forceY = force.x*GRID_SIZE_X*recipBoxVecY.x+force.y*GRID_SIZE_Y*recipBoxVecY.y;
+        real forceZ = force.x*GRID_SIZE_X*recipBoxVecZ.x+force.y*GRID_SIZE_Y*recipBoxVecZ.y+force.z*GRID_SIZE_Z*recipBoxVecZ.z;
+        if (laneInAtom < 3) {
+            real f = -charge*(laneInAtom == 0 ? forceX : (laneInAtom == 1 ? forceY : forceZ));
+#ifdef USE_PME_STREAM
+            ATOMIC_ADD(&forceBuffers[atom+laneInAtom*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(f));
+#else
+            forceBuffers[atom+laneInAtom*PADDED_NUM_ATOMS] += (mm_ulong) realToFixedPoint(f);
+#endif
+        }
+    }
+}
+
+#endif
