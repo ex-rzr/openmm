@@ -35,6 +35,7 @@ using namespace std;
 
 HipFFT3D::HipFFT3D(HipContext& context, int xsize, int ysize, int zsize, bool realToComplex) : context(context) {
     deviceIndex = context.getDeviceIndex();
+    stream = context.getCurrentStream();
     size_t valueSize = context.getUseDoublePrecision() ? sizeof(double) : sizeof(float);
     inputBufferSize = zsize * ysize * xsize * valueSize;
     if (realToComplex) {

@@ -28181,7 +28181,7 @@ static inline VkFFTResult VkFFT_transferDataFromCPU(VkFFTApplication* app, void*
 #elif(VKFFT_BACKEND==2)
 	hipError_t res = hipSuccess;
 	void* buffer = ((void**)input_buffer)[0];
-	res = hipMemcpy(buffer, cpu_arr, transferSize, hipMemcpyHostToDevice);
+	res = hipMemcpyWithStream(buffer, cpu_arr, transferSize, hipMemcpyHostToDevice, app->configuration.stream[app->configuration.streamID]);
 	if (res != hipSuccess) {
 		return VKFFT_ERROR_FAILED_TO_COPY;
 	}
@@ -28294,7 +28294,7 @@ static inline VkFFTResult VkFFT_transferDataToCPU(VkFFTApplication* app, void* c
 #elif(VKFFT_BACKEND==2)
 	hipError_t res = hipSuccess;
 	void* buffer = ((void**)output_buffer)[0];
-	res = hipMemcpy(cpu_arr, buffer, transferSize, hipMemcpyDeviceToHost);
+	res = hipMemcpyWithStream(cpu_arr, buffer, transferSize, hipMemcpyDeviceToHost, app->configuration.stream[app->configuration.streamID]);
 	if (res != hipSuccess) {
 		return VKFFT_ERROR_FAILED_TO_COPY;
 	}
